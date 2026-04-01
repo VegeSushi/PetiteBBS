@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  db:
+    image: mariadb:10.11
+    container_name: bbs_mariadb
+    restart: always
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "3306:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+      # Automatically mounts and runs the schema on first boot
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql 
+
+volumes:
+  db_data:
