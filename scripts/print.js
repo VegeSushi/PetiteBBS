@@ -13,7 +13,12 @@ function toPetscii(text) {
     let res = [];
     for (let i = 0; i < text.length; i++) {
         let r = text.charCodeAt(i);
-        if (r === 10 || r === 13) {
+        
+        // FIX 1: Ignore \r to prevent double-returns, and map \n to PETSCII 13.
+        // This naturally preserves intentional blank lines (e.g., \n\n)
+        if (r === 13) {
+            continue; 
+        } else if (r === 10) {
             res.push(13);
         } else if (r >= 97 && r <= 122) { 
             res.push(r - 32);
@@ -30,22 +35,23 @@ function toPetscii(text) {
                 case '^': res.push(94); break;
                 default: res.push(r); break;
             }
+        } else {
+            res.push(r); // Safely pass through other characters
         }
     }
 
-    let out = [];
-    for (let i = 0; i < res.length; i++) {
-        if (res[i] === 13 && res[i + 1] === 13) continue;
-        out.push(res[i]);
-    }
-    return Buffer.from(out);
+    return Buffer.from(res);
 }
 
 function fromPetscii(buf) {
     let res = [];
     for (let i = 0; i < buf.length; i++) {
         let c = buf[i];
-        if (c >= 65 && c <= 90) {
+        
+        // FIX 3: Map the PETSCII return key to a standard newline so the Node server reads it properly
+        if (c === 13) {
+            res.push(10); 
+        } else if (c >= 65 && c <= 90) {
             res.push(c + 32);
         } else if (c >= 193 && c <= 218) {
             res.push(c - 128);
@@ -59,7 +65,6 @@ function fromPetscii(buf) {
 module.exports = {
     fromPetscii,
     send: (socket, text) => {
-        // Now reads directly from the session config object instead of the user DB object
         const charset = socket.config ? socket.config.charset : 'ascii';
         const colorMode = socket.config ? socket.config.color : 'color';
         
@@ -70,12 +75,14 @@ module.exports = {
         let outputBuf;
         
         if (charset === 'petscii') {
-            let petsciiBuf = toPetscii(text + '\r\n');
+            // Append a standard \n, which toPetscii will perfectly map to a 13
+            let petsciiBuf = toPetscii(text + '\n');
             
             if (colorMode === 'color') {
                 let tempStr = petsciiBuf.toString('latin1');
                 for (const [colorName, colorCode] of Object.entries(ANSI_COLORS)) {
-                    const regex = new RegExp(`<${colorName}>(.*?)</${colorName}>`, 'g');
+                    // FIX 2: Added the 'i' (case-insensitive) flag because toPetscii shifts <cyan> to <CYAN>
+                    const regex = new RegExp(`<${colorName}>(.*?)</${colorName}>`, 'gi');
                     tempStr = tempStr.replace(regex, `${colorCode}$1${ANSI_RESET}`);
                 }
                 outputBuf = Buffer.from(tempStr, 'latin1');

@@ -42,10 +42,9 @@ const server = net.createServer((socket) => {
     let regData = {};
     let loginData = {};
     
-    const cleanInput = (data) => {
-        let text = socket.config.charset === 'petscii' ? fromPetscii(data) : data.toString();
-        return text.replace(/\r|\n/g, ''); 
-    };
+    // New variables for line buffering
+    socket.inputBuffer = '';
+    socket.lastCharCode = 0;
 
     const prompt = () => {
         switch(state) {
@@ -68,17 +67,15 @@ const server = net.createServer((socket) => {
             case 'LOGGED_IN': 
                 let cmds = "<yellow>/boards</yellow>, <yellow>/dms</yellow>, <yellow>/quit</yellow>";
                 if (socket.user.privilege_level >= 5) {
-                    cmds += "\n<cyan>SysOp:</cyan> /users, /setlevel [id] [1-5], /webpanel [on/off]";
+                    cmds += "\n<cyan>SysOp Tools:</cyan> /users, /setlevel [id] [1-5], /webpanel [on/off]";
                 }
                 send(socket, `\n<green>Logged in!</green> Commands: ${cmds}\nCommand: `); 
                 break;
         }
     };
 
-    socket.on('data', async (data) => {
-        const input = cleanInput(data); 
-        const trimmed = input.trim();   
-
+    // We moved the giant switch statement into its own function so we can call it when Enter is pressed
+    const processCommand = async (input, trimmed) => {
         try {
             switch(state) {
                 case 'INIT_ROWS': if (trimmed) socket.config.rows = parseInt(trimmed) || 25; state = 'INIT_COLS'; prompt(); break;
@@ -93,6 +90,7 @@ const server = net.createServer((socket) => {
                     else { prompt(); }
                     break;
                 
+                // Registration
                 case 'REG_HANDLE': if (!trimmed) return prompt(); regData.handle = trimmed; state = 'REG_NAME'; prompt(); break;
                 case 'REG_NAME': regData.name = trimmed; state = 'REG_COUNTRY'; prompt(); break;
                 case 'REG_COUNTRY': regData.country = trimmed; state = 'REG_EMAIL'; prompt(); break;
@@ -111,6 +109,7 @@ const server = net.createServer((socket) => {
                     } catch (err) { send(socket, `\n<red>Registration failed.</red>\n`); state = 'MAIN_MENU'; prompt(); } finally { if (regConn) regConn.release(); }
                     break;
 
+                // Login
                 case 'LOGIN_ID': if (!trimmed) return prompt(); loginData.id = trimmed; state = 'LOGIN_PASS'; prompt(); break;
                 case 'LOGIN_PASS':
                     let loginConn;
@@ -125,46 +124,59 @@ const server = net.createServer((socket) => {
                     } catch (err) { send(socket, `\n<red>Login error.</red>\n`); state = 'MAIN_MENU'; prompt(); } finally { if (loginConn) loginConn.release(); }
                     break;
 
+                // Root Menu & Admin Tools
                 case 'LOGGED_IN':
-                    if (trimmed === '/quit') { send(socket, "\n<yellow>Goodbye!</yellow>\n"); socket.end(); } 
-                    else if (trimmed === '/boards') { state = 'LIST_BOARDS'; await displayBoards(socket, pool); }
-                    else if (trimmed === '/dms') { send(socket, "\n<yellow>Direct Messages coming soon...</yellow>"); prompt(); }
-                    // --- SYSOP / LEVEL 5 COMMANDS ---
-                    else if (trimmed === '/users' && socket.user.privilege_level === 5) {
+                    if (trimmed === '/quit') { 
+                        send(socket, "\n<yellow>Goodbye!</yellow>\n"); socket.end(); 
+                    } 
+                    else if (trimmed === '/boards') { 
+                        state = 'LIST_BOARDS'; await displayBoards(socket, pool); 
+                    }
+                    else if (trimmed === '/dms') { 
+                        send(socket, "\n<yellow>Direct Messages coming soon...</yellow>"); prompt(); 
+                    }
+                    else if (trimmed === '/users' && socket.user.privilege_level >= 5) {
                         let uConn;
                         try {
                             uConn = await pool.getConnection();
                             const users = await uConn.query("SELECT id, handle, privilege_level FROM users ORDER BY id ASC");
                             send(socket, "\n<cyan>--- USER LIST ---</cyan>");
-                            users.forEach(u => { send(socket, `[ID: ${u.id}] ${u.handle} (Level ${u.privilege_level})`); });
+                            users.forEach(u => send(socket, `[ID: ${u.id}] ${u.handle} (Level ${u.privilege_level})`));
                             send(socket, "-".repeat(socket.config.cols));
-                        } catch (err) { send(socket, "\n<red>Database error.</red>"); } 
-                        finally { if (uConn) uConn.release(); }
+                        } catch (err) { send(socket, "\n<red>Database error.</red>"); } finally { if (uConn) uConn.release(); }
                         prompt();
                     }
-                    else if (trimmed.startsWith('/setlevel ') && socket.user.privilege_level === 5) {
+                    else if (trimmed.startsWith('/setlevel ') && socket.user.privilege_level >= 5) {
                         const parts = trimmed.split(' ');
-                        if (parts.length === 3 && !isNaN(parts[1]) && !isNaN(parts[2]) && parts[2] >= 1 && parts[2] <= 5) {
-                            let slConn;
-                            try {
-                                slConn = await pool.getConnection();
-                                await slConn.query("UPDATE users SET privilege_level = ? WHERE id = ?", [parts[2], parts[1]]);
-                                send(socket, `\n<green>Success: User ID ${parts[1]} is now Level ${parts[2]}.</green>`);
-                            } catch (err) { send(socket, "\n<red>Database error.</red>"); } 
-                            finally { if (slConn) slConn.release(); }
+                        if (parts.length === 3) {
+                            const targetId = parseInt(parts[1]);
+                            const newLevel = parseInt(parts[2]);
+                            if (!isNaN(targetId) && !isNaN(newLevel) && newLevel >= 1 && newLevel <= 5) {
+                                let slConn;
+                                try {
+                                    slConn = await pool.getConnection();
+                                    await slConn.query("UPDATE users SET privilege_level = ? WHERE id = ?", [newLevel, targetId]);
+                                    send(socket, `\n<green>Success: User ID ${targetId} is now Level ${newLevel}.</green>`);
+                                } catch (err) { send(socket, "\n<red>Database error.</red>"); } finally { if (slConn) slConn.release(); }
+                            } else { send(socket, `\n<red>Usage: /setlevel [user_id] [1-5]</red>`); }
                         } else { send(socket, `\n<red>Usage: /setlevel [user_id] [1-5]</red>`); }
                         prompt();
                     }
-                    else if (trimmed.startsWith('/webpanel ') && socket.user.privilege_level === 5) {
+                    else if (trimmed.startsWith('/webpanel ') && socket.user.privilege_level >= 5) {
                         const action = trimmed.split(' ')[1]?.toLowerCase();
-                        if (action === 'on') { global.webPanelActive = true; send(socket, `\n<green>Web Panel is now ONLINE.</green>`); } 
-                        else if (action === 'off') { global.webPanelActive = false; send(socket, `\n<yellow>Web Panel is now OFFLINE.</yellow>`); } 
-                        else { send(socket, `\n<red>Usage: /webpanel [on/off]</red>`); }
+                        if (action === 'on') {
+                            global.webPanelActive = true;
+                            send(socket, `\n<green>Web Panel is now ONLINE.</green>`);
+                        } else if (action === 'off') {
+                            global.webPanelActive = false;
+                            send(socket, `\n<yellow>Web Panel is now OFFLINE.</yellow>`);
+                        } else { send(socket, `\n<red>Usage: /webpanel [on/off]</red>`); }
                         prompt();
                     }
                     else { send(socket, `\n<red>Unknown command.</red>`); prompt(); }
                     break;
 
+                // Board Interactions
                 case 'LIST_BOARDS':
                     if (trimmed.startsWith('/deleteboard ')) {
                         const targetBoard = trimmed.substring(13).trim();
@@ -181,22 +193,20 @@ const server = net.createServer((socket) => {
                                     send(socket, `\n<green>Board 'p/${targetBoard}' successfully deleted.</green>\n`);
                                 } else { send(socket, `\n<red>Access Denied: You do not own this board.</red>\n`); }
                             }
-                        } catch (err) { send(socket, `\n<red>Database error.</red>\n`); } 
-                        finally { if (delConn) delConn.release(); }
+                        } catch (err) { send(socket, `\n<red>Database error.</red>\n`); } finally { if (delConn) delConn.release(); }
                         await displayBoards(socket, pool);
                         
                     } else if (trimmed.startsWith('/createboard ')) {
                         const newBoardTitle = trimmed.substring(13).trim();
                         if (!/^[A-Za-z0-9]+$/.test(newBoardTitle)) {
                             send(socket, `\n<red>Invalid name. Letters and numbers only (no spaces).</red>\n`);
-                            await displayBoards(socket, pool);
-                            break;
+                            await displayBoards(socket, pool); break;
                         }
                         if (socket.user.privilege_level < 3) {
                             send(socket, `\n<red>Access Denied: Level 3+ required to create boards.</red>\n`);
-                            await displayBoards(socket, pool);
-                            break;
+                            await displayBoards(socket, pool); break;
                         }
+
                         let createConn;
                         try {
                             createConn = await pool.getConnection();
@@ -204,9 +214,7 @@ const server = net.createServer((socket) => {
                                 const countRes = await createConn.query("SELECT COUNT(*) as count FROM boards WHERE created_by = ?", [socket.user.id]);
                                 if (Number(countRes[0].count) >= 1) {
                                     send(socket, `\n<red>Quota exceeded: Level 3 users can only create 1 board.</red>\n`);
-                                    createConn.release();
-                                    await displayBoards(socket, pool);
-                                    return;
+                                    createConn.release(); await displayBoards(socket, pool); break;
                                 }
                             }
                             const existing = await createConn.query("SELECT id FROM boards WHERE title = ?", [newBoardTitle]);
@@ -216,8 +224,7 @@ const server = net.createServer((socket) => {
                                 await createConn.query("INSERT INTO boards (title, created_by) VALUES (?, ?)", [newBoardTitle, socket.user.id]);
                                 send(socket, `\n<green>Board 'p/${newBoardTitle}' successfully created!</green>\n`);
                             }
-                        } catch (err) { send(socket, `\n<red>Database error.</red>\n`); } 
-                        finally { if (createConn) createConn.release(); }
+                        } catch (err) { send(socket, `\n<red>Database error.</red>\n`); } finally { if (createConn) createConn.release(); }
                         await displayBoards(socket, pool);
                         
                     } else {
@@ -229,24 +236,16 @@ const server = net.createServer((socket) => {
                     }
                     break;
 
+                // Post Interactions
                 case 'LIST_POSTS':
                     if (trimmed.startsWith('/deletepost ')) {
                         const targetPost = parseInt(trimmed.substring(12).trim());
-                        if (isNaN(targetPost)) {
-                            send(socket, `\n<red>Invalid post ID.</red>\n`);
-                            await displayPosts(socket, pool);
-                            break;
-                        }
+                        if (isNaN(targetPost)) { send(socket, `\n<red>Invalid post ID.</red>\n`); await displayPosts(socket, pool); break; }
                         
                         let delConn;
                         try {
                             delConn = await pool.getConnection();
-                            const pRes = await delConn.query(`
-                                SELECT p.author_id, b.created_by as board_owner 
-                                FROM posts p JOIN boards b ON p.board_id = b.id 
-                                WHERE p.id = ? AND p.board_id = ?
-                            `, [targetPost, socket.currentBoard.id]);
-                            
+                            const pRes = await delConn.query(`SELECT p.author_id, b.created_by as board_owner FROM posts p JOIN boards b ON p.board_id = b.id WHERE p.id = ? AND p.board_id = ?`, [targetPost, socket.currentBoard.id]);
                             if (pRes.length === 0) {
                                 send(socket, `\n<red>Post #${targetPost} not found in this board.</red>\n`);
                             } else {
@@ -256,19 +255,19 @@ const server = net.createServer((socket) => {
                                     send(socket, `\n<green>Post #${targetPost} successfully deleted.</green>\n`);
                                 } else { send(socket, `\n<red>Access Denied: You cannot delete this post.</red>\n`); }
                             }
-                        } catch (err) { send(socket, `\n<red>Database error.</red>\n`); } 
-                        finally { if (delConn) delConn.release(); }
+                        } catch (err) { send(socket, `\n<red>Database error.</red>\n`); } finally { if (delConn) delConn.release(); }
                         await displayPosts(socket, pool);
+                        
                     } else {
                         await handlePostInput(socket, pool, trimmed, (newState) => {
                             state = newState;
                             if (newState === 'LIST_BOARDS') displayBoards(socket, pool);
                             if (newState === 'WRITE_POST_TITLE') send(socket, "\n<green>--- New Post ---</green>\nTitle: ");
-                            if (newState === 'READ_POST') { /* handled inside initReadPost */ }
                         });
                     }
                     break;
 
+                // Post Writing
                 case 'WRITE_POST_TITLE':
                     if (!trimmed) { send(socket, "Title (required): "); return; }
                     socket.newPost = { title: trimmed, content: [] };
@@ -283,8 +282,7 @@ const server = net.createServer((socket) => {
                             postConn = await pool.getConnection();
                             await postConn.query("INSERT INTO posts (board_id, author_id, title, content) VALUES (?, ?, ?, ?)", [socket.currentBoard.id, socket.user.id, socket.newPost.title, socket.newPost.content.join('\n')]);
                             send(socket, "\n<green>Post published!</green>\n");
-                        } catch (err) { send(socket, "\n<red>Error saving post.</red>\n"); } 
-                        finally { if (postConn) postConn.release(); }
+                        } catch (err) { send(socket, "\n<red>Error saving post.</red>\n"); } finally { if (postConn) postConn.release(); }
                         state = 'LIST_POSTS';
                         await displayPosts(socket, pool);
                     } else {
@@ -293,21 +291,81 @@ const server = net.createServer((socket) => {
                     }
                     break;
 
+                // Post Reading
                 case 'READ_POST':
                     if (input === ' ' || trimmed.toLowerCase() === 'n') {
                         if (socket.readPost.currentIndex < socket.readPost.lines.length) {
                             displayReadPostChunk(socket);
                         } else {
-                            state = 'LIST_POSTS';
-                            await displayPosts(socket, pool);
+                            state = 'LIST_POSTS'; await displayPosts(socket, pool);
                         }
                     } else {
-                        state = 'LIST_POSTS';
-                        await displayPosts(socket, pool);
+                        state = 'LIST_POSTS'; await displayPosts(socket, pool);
                     }
                     break;
             }
         } catch (e) { console.error("Error:", e); }
+    };
+
+    // THIS IS THE NEW BUFFERING LOGIC THAT FIXES THE C64 ISSUE
+    socket.on('data', async (data) => {
+        for (let i = 0; i < data.length; i++) {
+            const charCode = data[i];
+
+            // 1. Ignore Telnet Negotiation bytes (starts with 255/IAC)
+            if (charCode === 255) { i += 2; continue; }
+
+            // 2. Handle Backspace / Delete (ASCII 8, ASCII 127, PETSCII 20)
+            if (charCode === 8 || charCode === 127 || charCode === 20) {
+                if (socket.inputBuffer.length > 0) {
+                    socket.inputBuffer = socket.inputBuffer.slice(0, -1);
+                    // Erase character visually on client screen
+                    if (socket.config.charset === 'petscii') {
+                        socket.write(Buffer.from([20])); // C64 destructive backspace
+                    } else {
+                        socket.write(Buffer.from([8, 32, 8])); // VT100 destructive backspace
+                    }
+                }
+                continue;
+            }
+
+            // 3. Handle Enter / Newline (CR=13 or LF=10)
+            if (charCode === 13 || charCode === 10) {
+                if (charCode === 10 && socket.lastCharCode === 13) continue; // Ignore LF right after CR
+                socket.lastCharCode = charCode;
+
+                // Echo newline sequence visually
+                if (socket.config.charset === 'petscii') socket.write(Buffer.from([13]));
+                else socket.write(Buffer.from('\r\n'));
+
+                // Extract line, wipe buffer, and process!
+                const rawInput = socket.inputBuffer;
+                const trimmedInput = rawInput.trim();
+                socket.inputBuffer = '';
+                await processCommand(rawInput, trimmedInput);
+                continue;
+            }
+
+            socket.lastCharCode = charCode;
+
+            // 4. Buffer and Echo Normal Characters
+            if (charCode >= 32 || (socket.config.charset === 'petscii' && ((charCode >= 65 && charCode <= 90) || (charCode >= 193 && charCode <= 218)))) {
+                
+                // Convert bytes dynamically to standard UTF8 JS Strings
+                const charStr = socket.config.charset === 'petscii' 
+                    ? fromPetscii(Buffer.from([charCode])) 
+                    : String.fromCharCode(charCode);
+                
+                socket.inputBuffer += charStr;
+
+                // Handle visual echo back to the user
+                if (state === 'REG_PASS' || state === 'REG_PASS_VERIFY' || state === 'LOGIN_PASS') {
+                    socket.write(Buffer.from('*')); // Hide passwords
+                } else {
+                    socket.write(Buffer.from([charCode])); // Echo exact byte they sent
+                }
+            }
+        }
     });
 
     socket.on('end', () => {});
