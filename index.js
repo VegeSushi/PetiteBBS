@@ -2,13 +2,14 @@ require('dotenv').config();
 const net = require('net');
 const mariadb = require('mariadb');
 const bcrypt = require('bcrypt');
+
+// Set global state for the Web Panel killswitch
+global.webPanelActive = true;
+
 const { send, fromPetscii } = require('./scripts/print');
 const { startWebServer } = require('./scripts/web');
 const { displayBoards, handleBoardInput } = require('./scripts/boards');
 const { displayPosts, handlePostInput, displayReadPostChunk } = require('./scripts/posts');
-
-// Global killswitch for the web panel
-global.webPanelActive = false;
 
 const pool = mariadb.createPool({
     host: process.env.DB_HOST,
@@ -37,12 +38,12 @@ async function initializeDefaultUser() {
 }
 
 const server = net.createServer((socket) => {
-    socket.config = { rows: 25, cols: 40, charset: 'ascii', color: 'color' };
+    socket.config = { rows: 25, cols: 40, charset: 'ascii', color: 'color', lf: 'crlf' };
     let state = 'INIT_ROWS';
     let regData = {};
     let loginData = {};
     
-    // New variables for line buffering
+    // Variables for line buffering (C64 fix)
     socket.inputBuffer = '';
     socket.lastCharCode = 0;
 
@@ -51,6 +52,7 @@ const server = net.createServer((socket) => {
             case 'INIT_ROWS': send(socket, "Enter ROW size (Default 25): "); break;
             case 'INIT_COLS': send(socket, "Enter COLUMN size (Default 40): "); break;
             case 'INIT_CHARSET': send(socket, "ASCII or PETSCII? (Default ASCII): "); break;
+            case 'INIT_LF': send(socket, "Linefeed? (CR, LF, CRLF) (Default CRLF): "); break;
             case 'INIT_COLOR': send(socket, "MONO or COLOR? (Default COLOR): "); break;
             case 'MAIN_MENU':
                 send(socket, "\n<cyan>=== WELCOME TO THE BBS ===</cyan>\n[1] Register\n[2] Login\n[3] Guest Login\n\nChoice: ");
@@ -74,13 +76,17 @@ const server = net.createServer((socket) => {
         }
     };
 
-    // We moved the giant switch statement into its own function so we can call it when Enter is pressed
     const processCommand = async (input, trimmed) => {
         try {
             switch(state) {
                 case 'INIT_ROWS': if (trimmed) socket.config.rows = parseInt(trimmed) || 25; state = 'INIT_COLS'; prompt(); break;
                 case 'INIT_COLS': if (trimmed) socket.config.cols = parseInt(trimmed) || 40; state = 'INIT_CHARSET'; prompt(); break;
-                case 'INIT_CHARSET': if (trimmed.toLowerCase() === 'petscii') socket.config.charset = 'petscii'; state = 'INIT_COLOR'; prompt(); break;
+                case 'INIT_CHARSET': if (trimmed.toLowerCase() === 'petscii') socket.config.charset = 'petscii'; state = 'INIT_LF'; prompt(); break;
+                case 'INIT_LF': 
+                    const lfInput = trimmed.toLowerCase();
+                    if (lfInput === 'cr' || lfInput === 'lf') socket.config.lf = lfInput;
+                    else socket.config.lf = 'crlf';
+                    state = 'INIT_COLOR'; prompt(); break;
                 case 'INIT_COLOR': if (trimmed.toLowerCase() === 'mono') socket.config.color = 'mono'; state = 'MAIN_MENU'; prompt(); break;
                 
                 case 'MAIN_MENU':
@@ -307,7 +313,6 @@ const server = net.createServer((socket) => {
         } catch (e) { console.error("Error:", e); }
     };
 
-    // THIS IS THE NEW BUFFERING LOGIC THAT FIXES THE C64 ISSUE
     socket.on('data', async (data) => {
         for (let i = 0; i < data.length; i++) {
             const charCode = data[i];
@@ -334,9 +339,13 @@ const server = net.createServer((socket) => {
                 if (charCode === 10 && socket.lastCharCode === 13) continue; // Ignore LF right after CR
                 socket.lastCharCode = charCode;
 
-                // Echo newline sequence visually
-                if (socket.config.charset === 'petscii') socket.write(Buffer.from([13]));
-                else socket.write(Buffer.from('\r\n'));
+                // Echo newline sequence visually based on user's chosen linefeed config
+                if (socket.config.charset === 'petscii') {
+                    socket.write(Buffer.from([13]));
+                } else {
+                    const lfStr = socket.config.lf === 'cr' ? '\r' : (socket.config.lf === 'lf' ? '\n' : '\r\n');
+                    socket.write(Buffer.from(lfStr));
+                }
 
                 // Extract line, wipe buffer, and process!
                 const rawInput = socket.inputBuffer;
